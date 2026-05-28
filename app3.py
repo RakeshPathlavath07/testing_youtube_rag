@@ -2,6 +2,8 @@ import os
 import re
 import streamlit as st
 from dotenv import load_dotenv
+import requests
+from http.cookiejar import MozillaCookieJar
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain_core.documents import Document
@@ -95,7 +97,26 @@ if st.button("Process Video"):
     else:
         with st.spinner("Fetching transcript and processing chunks..."):
             try:
-                api = YouTubeTranscriptApi()
+                # 1. Create a requests session
+                session = requests.Session()
+
+                # 2. Load the cookies.txt file
+                cookie_jar = MozillaCookieJar('cookies.txt')
+                cookie_jar.load(ignore_discard=True, ignore_expires=True)
+
+                # 3. Clean the cookies: Remove any that contain non-ASCII characters
+                for cookie in list(cookie_jar):
+                    try:
+                        cookie.name.encode('ascii')
+                        cookie.value.encode('ascii')
+                    except UnicodeEncodeError:
+                        # If a cookie contains invalid characters, remove it
+                        cookie_jar.clear(cookie.domain, cookie.path, cookie.name)
+
+                session.cookies = cookie_jar
+
+                # 4. Initialize YouTubeTranscriptApi with the authenticated session
+                api = YouTubeTranscriptApi(http_client=session)
                 transcript_list = api.fetch(vid_id, languages=['en'])
                 
                 transcript_with_timestamps = []
