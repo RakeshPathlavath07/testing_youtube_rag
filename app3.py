@@ -8,39 +8,32 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace, HuggingFaceEndpointEmbeddings
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
-# Load environment variables
 load_dotenv()
 
 hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN")
 
-# Helper to format seconds into MM:SS
+# ── Helper: seconds → MM:SS ──────────────────────────────────────────────────
 def seconds_to_timestamp(seconds):
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes:02d}:{secs:02d}"
 
-# Robust helper to extract 11-character YouTube ID from any URL format
+# ── Helper: extract YouTube video ID ────────────────────────────────────────
 def extract_video_id(url_or_id):
     url_or_id = url_or_id.strip()
     if len(url_or_id) == 11:
         return url_or_id
-    
-    # Matches watch?v=, /v/, embed/, shorts/, and youtu.be/ formats
     pattern = r"(?:v=|/v/|embed/|youtu\.be/|/shorts/)([a-zA-Z0-9_-]{11})"
     match = re.search(pattern, url_or_id)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
-# Custom sliding-window text splitter to replace the broken langchain_text_splitters
+# ── Helper: sliding-window text splitter ────────────────────────────────────
 def split_text_manually(text, chunk_size=800, overlap=200):
     chunks = []
     if not text:
         return chunks
-    
     start = 0
     while start < len(text):
         end = start + chunk_size
@@ -50,14 +43,14 @@ def split_text_manually(text, chunk_size=800, overlap=200):
             break
     return chunks
 
-# Format documents with timestamps
+# ── Helper: format retrieved docs with timestamps ───────────────────────────
 def format_docs(retrieved_docs):
     return "\n\n".join(
         f"[Timestamp: {seconds_to_timestamp(doc.metadata['start'])} to {seconds_to_timestamp(doc.metadata['end'])}]\n{doc.page_content}"
         for doc in retrieved_docs
     )
 
-# Use API-based Embeddings
+# ── Embeddings model (cached) ────────────────────────────────────────────────
 @st.cache_resource
 def get_embeddings_model():
     return HuggingFaceEndpointEmbeddings(
@@ -66,47 +59,91 @@ def get_embeddings_model():
         huggingfacehub_api_token=hf_token
     )
 
-# App UI Setup
+# ── Load cookies from Streamlit secrets ──────────────────────────────────────
+def load_cookies_from_secrets() -> str | None:
+    """
+    Writes cookie content from st.secrets to a temp file and returns its path.
+    Returns None if the secret isn't configured.
+    """
+    try:
+        cookie_content = st.secrets["youtube"]["cookies"]
+        cookie_path = "/tmp/yt_cookies.txt"
+        with open(cookie_path, "w") as f:
+            f.write(cookie_content)
+        return cookie_path
+    except (KeyError, FileNotFoundError):
+        return None
+
+# ── Fetch transcript with optional cookie path ───────────────────────────────
+def fetch_transcript(vid_id: str, cookie_path: str | None = None):
+    """
+    Attempts to fetch the transcript.
+    - If cookie_path is provided, passes it to the API for authenticated requests.
+    - Falls back to unauthenticated if cookies aren't set.
+    """
+    if cookie_path and os.path.exists(cookie_path):
+        api = YouTubeTranscriptApi(cookies=cookie_path)
+    else:
+        api = YouTubeTranscriptApi()
+    return api.fetch(vid_id, languages=['en'])
+
+# ════════════════════════════════════════════════════════════════════════════
+# APP UI
+# ════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="YouTube RAG Assistant", layout="centered")
 st.title("YouTube Video RAG Assistant")
 
 if not hf_token:
-    st.error("Hugging Face API token not found. Please ensure HUGGINGFACEHUB_API_TOKEN is set in your environment configuration.")
+    st.error("Hugging Face API token not found. Please set HUGGINGFACEHUB_API_TOKEN in your environment.")
     st.stop()
 
-# Session State Initialization
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "current_video_id" not in st.session_state:
-    st.session_state.current_video_id = None
+# ── Session state ─────────────────────────────────────────────────────────────
+for key, default in [
+    ("vector_store", None),
+    ("current_video_id", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# Main Input Section
+# CHANGED: Load cookie_path from secrets instead of defaulting to None
+if "cookie_path" not in st.session_state:
+    st.session_state.cookie_path = load_cookies_from_secrets()
+
+# ── Cookie status indicator ───────────────────────────────────────────────────
+if st.session_state.cookie_path:
+    st.success("🍪 YouTube cookies loaded from secrets.")
+else:
+    st.warning("⚠️ No YouTube cookies configured. Add `[youtube] cookies = ...` to your Streamlit secrets.")
+
+# ── Video URL input ───────────────────────────────────────────────────────────
+st.markdown("---")
 video_input = st.text_input("Enter YouTube Video URL or 11-character Video ID:")
 
-# Verify if the input changed vs what is currently loaded in memory
 input_vid_id = extract_video_id(video_input)
-if input_vid_id and st.session_state.current_video_id and st.session_state.current_video_id != "Manual Input" and input_vid_id != st.session_state.current_video_id:
-    st.warning("⚠️ The video ID in the input box has changed. Please click 'Process Video' to load the new video before asking questions.")
+if (
+    input_vid_id
+    and st.session_state.current_video_id
+    and st.session_state.current_video_id != "Manual Input"
+    and input_vid_id != st.session_state.current_video_id
+):
+    st.warning("⚠️ Video ID changed. Click **Process Video** to load the new video.")
 
 if st.button("Process Video"):
     vid_id = extract_video_id(video_input)
     if not vid_id:
-        st.error("Could not parse a valid YouTube Video ID from your input. Please check the URL.")
+        st.error("Could not parse a valid YouTube Video ID. Please check the URL.")
     else:
         with st.spinner("Fetching transcript and processing chunks..."):
             try:
-                api = YouTubeTranscriptApi()
-                transcript_list = api.fetch(vid_id, languages=['en'])
-                
-                transcript_with_timestamps = []
-                for chunk in transcript_list:
-                    transcript_with_timestamps.append({
-                        "text": chunk.text,
-                        "start": chunk.start,
-                        "end": chunk.start + chunk.duration
-                    })
-                
-                # Chunking logic using custom sliding window
+                # Pass cookie path from session state
+                transcript_list = fetch_transcript(vid_id, st.session_state.cookie_path)
+
+                transcript_with_timestamps = [
+                    {"text": chunk.text, "start": chunk.start, "end": chunk.start + chunk.duration}
+                    for chunk in transcript_list
+                ]
+
+                # Sliding-window chunking preserving timestamps
                 CHUNK_CHAR_LIMIT = 800
                 CHUNK_OVERLAP = 200
                 documents = []
@@ -116,85 +153,73 @@ if st.button("Process Video"):
                 for item in transcript_with_timestamps:
                     if current_start is None:
                         current_start = item["start"]
-
                     current_text += " " + item["text"]
-
                     if len(current_text) >= CHUNK_CHAR_LIMIT:
-                        documents.append(
-                            Document(
-                                page_content=current_text.strip(),
-                                metadata={
-                                    "start": current_start,
-                                    "end": item["end"]
-                                }
-                            )
-                        )
+                        documents.append(Document(
+                            page_content=current_text.strip(),
+                            metadata={"start": current_start, "end": item["end"]}
+                        ))
                         current_text = current_text[-CHUNK_OVERLAP:]
                         current_start = item["start"]
 
                 if current_text.strip():
-                    documents.append(
-                        Document(
-                            page_content=current_text.strip(),
-                            metadata={
-                                "start": current_start,
-                                "end": transcript_with_timestamps[-1]["end"]
-                            }
-                        )
-                    )
+                    documents.append(Document(
+                        page_content=current_text.strip(),
+                        metadata={"start": current_start, "end": transcript_with_timestamps[-1]["end"]}
+                    ))
 
-                # Initialize Vector Store
                 embeddings = get_embeddings_model()
                 st.session_state.vector_store = FAISS.from_documents(documents, embeddings)
                 st.session_state.current_video_id = vid_id
-                st.success(f"Successfully processed video: {vid_id}!")
+                st.success(f"✅ Successfully processed video: `{vid_id}`!")
 
             except TranscriptsDisabled:
                 st.error("Captions are disabled/unavailable for this video.")
             except Exception as e:
-                if "blocking requests from your IP" in str(e) or "cloud provider" in str(e):
-                    st.error("⚠️ YouTube is currently blocking automatic transcript requests from Streamlit's cloud servers.")
-                    st.info("Please use the **Manual Transcript Fallback** option below to paste the transcript text directly.")
+                err = str(e)
+                if "blocking requests" in err or "cloud provider" in err or "429" in err:
+                    st.error("⚠️ YouTube is blocking requests from this server's IP.")
+                    st.info(
+                        "**Fix:** Add your `cookies.txt` content to Streamlit secrets under "
+                        "`[youtube] cookies = ...`, then reboot the app. "
+                        "Or use the Manual Transcript fallback below."
+                    )
                 else:
                     st.error(f"Failed to process video: {e}")
 
-# Expandable Fallback Input Section
+# ── Manual transcript fallback ────────────────────────────────────────────────
 st.markdown("---")
-with st.expander("📝 Manual Transcript Fallback (Use this if YouTube blocks the server)"):
-    st.write("You can copy the transcript directly from YouTube and paste it here.")
-    manual_text = st.text_area("Paste raw transcript or text content here:", height=200)
+with st.expander("📝 Manual Transcript Fallback"):
+    st.write("Copy the transcript from YouTube's '...' → 'Show transcript' panel and paste below.")
+    manual_text = st.text_area("Paste raw transcript text here:", height=200)
     if st.button("Process Manual Text"):
         if not manual_text.strip():
             st.warning("Please paste some text first.")
         else:
             with st.spinner("Processing manual text..."):
                 try:
-                    # Using our custom local Python text splitter
                     chunks = split_text_manually(manual_text, chunk_size=800, overlap=200)
                     documents = [
-                        Document(
-                            page_content=chunk,
-                            metadata={"start": 0, "end": 0}  # Placeholder timestamps
-                        )
+                        Document(page_content=chunk, metadata={"start": 0, "end": 0})
                         for chunk in chunks
                     ]
                     embeddings = get_embeddings_model()
                     st.session_state.vector_store = FAISS.from_documents(documents, embeddings)
                     st.session_state.current_video_id = "Manual Input"
-                    st.success(f"Successfully processed manual text! Created {len(documents)} chunks.")
+                    st.success(f"✅ Processed manual text into {len(documents)} chunks.")
                 except Exception as e:
                     st.error(f"Failed to process manual text: {e}")
 
-# Query Section
+# ── Query section ─────────────────────────────────────────────────────────────
 if st.session_state.vector_store is not None:
     st.divider()
     if st.session_state.current_video_id == "Manual Input":
-        st.info("👉 **Currently Querying:** Manually pasted transcript text.")
+        st.info("👉 **Currently Querying:** Manually pasted transcript.")
     else:
         st.info(f"👉 **Currently Querying Video:** `https://youtube.com/watch?v={st.session_state.current_video_id}`")
-    
+
     question = st.text_input("Ask a question about the active video:")
-    
+
     if st.button("Ask Assistant"):
         if not question.strip():
             st.warning("Please enter a question.")
@@ -209,17 +234,19 @@ if st.session_state.vector_store is not None:
                         huggingfacehub_api_token=hf_token
                     )
                     chat_model = ChatHuggingFace(llm=llm)
-                    
+
                     retriever = st.session_state.vector_store.as_retriever(
-                        search_type="similarity", 
+                        search_type="similarity",
                         search_kwargs={"k": 4}
                     )
-
                     retrieved_docs = retriever.invoke(question)
-                    
-                    with st.expander("🔍 View Retrieved Context Chunks (With Timestamps)"):
+
+                    with st.expander("🔍 Retrieved Context Chunks (With Timestamps)"):
                         for i, doc in enumerate(retrieved_docs):
-                            st.markdown(f"**Chunk {i+1}** [{seconds_to_timestamp(doc.metadata['start'])} - {seconds_to_timestamp(doc.metadata['end'])}]")
+                            st.markdown(
+                                f"**Chunk {i+1}** "
+                                f"[{seconds_to_timestamp(doc.metadata['start'])} - {seconds_to_timestamp(doc.metadata['end'])}]"
+                            )
                             st.write(doc.page_content)
                             st.divider()
 
@@ -255,9 +282,8 @@ Question:
 
                     context_text = format_docs(retrieved_docs)
                     final_prompt = prompt.format(context=context_text, question=question)
-                    
                     response = chat_model.invoke(final_prompt)
-                    
+
                     st.markdown("### Answer:")
                     st.write(response.content)
 
